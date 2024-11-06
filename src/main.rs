@@ -3,15 +3,18 @@ use std::collections::{BTreeMap, VecDeque};
 use alloy::primitives::U256;
 use anyhow::{bail, Result};
 
+#[derive(Clone)]
 enum Side {
     Bid,
     Ask,
 }
 
+#[derive(Clone)]
 struct Order {
     owner: String,
     nonce: U256,
     quantity: U256,
+    filled_quantity: U256,
     limit_price: U256,
     stop_price: U256,
     expire_timestamp: u64,
@@ -111,12 +114,75 @@ impl OrderBook {
         Ok(())
     }
 
-    fn take_order(&mut self, side: Side) -> Option<(Order, Vec<Order>)> {
-        match side {
-            Side::Bid => todo!(),
-            Side::Ask => todo!(),
+    fn take_bid_order(&mut self, cursor: usize) -> Option<(Order, Vec<Order>)> {
+        // take the oldest market order
+        let Some(taker_order) = self.market_bids.get_mut(cursor) else {
+            // TODO: go through stop orders
+            return None;
         };
-        None
+
+        let mut taker_available_quantity = taker_order.quantity - taker_order.filled_quantity;
+        let mut maker_orders: Vec<Order> = Vec::new();
+        let mut empty_price_levels: Vec<U256> = Vec::new();
+
+        // go through limit asks at each price level
+        for (price_level, asks) in self.asks.iter_mut() {
+            // go through each limit ask in this price level, oldest first
+            let mut ask_cursor = 0;
+            loop {
+                match asks.get_mut(ask_cursor) {
+                    Some(ask) => {
+                        let ask_available_quantity = ask.quantity - ask.filled_quantity;
+                        // if the ask order is only partially filled
+                        if ask_available_quantity > taker_available_quantity {
+                            if ask.only_full_fill {
+                                ask_cursor += 1;
+                                continue;
+                            }
+                            ask.filled_quantity += taker_available_quantity;
+                            maker_orders.push(ask.clone());
+                            taker_available_quantity = U256::ZERO;
+                        } else {
+                            // if the ask order is completely filled
+                            maker_orders.push(asks.remove(ask_cursor).unwrap());
+                            taker_available_quantity -= ask_available_quantity;
+                        }
+                    }
+                    None => {
+                        if ask_cursor == 0 {
+                            empty_price_levels.push(*price_level);
+                        }
+                        break;
+                    }
+                }
+                if taker_available_quantity == U256::ZERO {
+                    break;
+                }
+            }
+            if taker_available_quantity == U256::ZERO {
+                break;
+            }
+        }
+
+        for empty_price_level in empty_price_levels {
+            self.asks.remove(&empty_price_level);
+        }
+
+        if taker_available_quantity > U256::ZERO {
+            if taker_order.only_full_fill {
+                return self.take_bid_order(cursor + 1);
+            }
+            taker_order.filled_quantity = taker_order.quantity - taker_available_quantity;
+            if maker_orders.len() > 0 {
+                return Some((taker_order.clone(), maker_orders));
+            }
+            return None;
+        } else {
+            if maker_orders.len() > 0 {
+                return Some((self.market_bids.remove(cursor).unwrap(), maker_orders));
+            }
+            return None;
+        }
     }
 }
 
